@@ -164,12 +164,99 @@ class BipedWF(BaseTask):
         )
         # pd controller
         torques = self.p_gains * (pos_action + self.default_dof_pos - self.dof_pos) + self.d_gains * (vel_action - self.dof_vel)
-        torques = torch.clip(torques, -self.torque_limits, self.torque_limits )  # torque limit is lower than the torque-requiring lower bound
-        return torques * self.torques_scale #notice that even send torque at torque limit , real motor may generate bigger torque that limit!!!!!!!!!!
+        torques = torch.clip(torques, -self.torque_limits, self.torque_limits )
+        return torques * self.torques_scale
 
     def post_physics_step(self):
         super().post_physics_step()
         self.wheel_lin_vel = self.foot_velocities[:, 0, :] + self.foot_velocities[:, 1, :]
+
+    def _build_nominal_gains(self, gain_cfg):
+        nominal_gains = torch.zeros(
+            self.num_envs,
+            self.num_dof,
+            dtype=torch.float,
+            device=self.device,
+            requires_grad=False,
+        )
+        for i in range(self.num_dofs):
+            name = self.dof_names[i]
+            for dof_name, gain in gain_cfg.items():
+                if dof_name in name:
+                    nominal_gains[:, i] = gain
+                    break
+        return nominal_gains
+
+    def _safe_scale(self, value, nominal_value):
+        return torch.where(
+            torch.abs(nominal_value) > 1e-6,
+            value / nominal_value,
+            torch.ones_like(value),
+        )
+
+    def _privileged_attr(self, attr_name, width, default_value=0.0):
+        value = getattr(self, attr_name, None)
+        if value is None:
+            return torch.full(
+                (self.num_envs, width),
+                default_value,
+                dtype=torch.float,
+                device=self.device,
+                requires_grad=False,
+            )
+        if not torch.is_tensor(value):
+            value = torch.tensor(value, dtype=torch.float, device=self.device)
+        else:
+            value = value.to(device=self.device, dtype=torch.float)
+        if value.dim() == 0:
+            value = value.view(1, 1).repeat(self.num_envs, width)
+        elif value.dim() == 1:
+            value = value.unsqueeze(-1)
+        value = value.view(self.num_envs, -1)
+        if value.shape[1] != width:
+            value = value[:, :width]
+        return value
+
+    def _get_privileged_domain_rand_obs(self):
+        friction = self._privileged_attr("friction_coeffs", 1)
+        restitution = self._privileged_attr("restitution_coef", 1)
+        base_mass = self._privileged_attr("base_mass", 1)
+        base_com = self._privileged_attr("base_com", 3)
+        inertia_scale = self._privileged_attr("inertia_scale", 1)
+        action_delay = self.action_delay_idx.float().unsqueeze(-1) * self.sim_params.dt
+        imu_offset = self._privileged_attr("random_imu_offset", 4, default_value=0.0)
+
+        p_gain_scale = self._safe_scale(self.p_gains, self.nominal_p_gains)
+        d_gain_scale = self._safe_scale(self.d_gains, self.nominal_d_gains)
+        motor_torque_scale = self.torques_scale
+        default_dof_pos_offset = self.default_dof_pos - self.raw_default_dof_pos.unsqueeze(0)
+
+        push_force = self.rigid_body_external_forces[:, 0, :]
+        if self.cfg.domain_rand.push_robots:
+            max_push_force = (
+                self.base_mass.mean().clamp_min(1e-6)
+                * self.cfg.domain_rand.max_push_vel_xy
+                / self.sim_params.dt
+            )
+            push_force = push_force / max_push_force
+
+        return torch.cat(
+            (
+                friction,
+                restitution,
+                base_mass,
+                base_com,
+                inertia_scale,
+                action_delay,
+                imu_offset,
+                p_gain_scale,
+                d_gain_scale,
+                motor_torque_scale,
+                default_dof_pos_offset,
+                push_force,
+            ),
+            dim=-1,
+        )
 
     def compute_group_observations(self):
         # note that observation noise need to modified accordingly !!!
@@ -190,10 +277,66 @@ class BipedWF(BaseTask):
             ),
             dim=-1,
         )
-        critic_obs_buf = torch.cat((
-            self.base_lin_vel * self.obs_scales.lin_vel, self.obs_buf), dim=-1)
+        critic_obs_buf = torch.cat(
+            (
+                self.base_lin_vel * self.obs_scales.lin_vel,
+                obs_buf,
+                self._get_privileged_domain_rand_obs(),
+            ),
+            dim=-1,
+        )
         return obs_buf, critic_obs_buf
-    
+
+    def _process_rigid_body_props(self, props, env_id):
+        # randomize base mass
+        if self.cfg.domain_rand.randomize_base_mass:
+            if env_id == 0:
+                min_add_mass, max_add_mass = self.cfg.domain_rand.added_mass_range
+                self.base_add_mass = (
+                    torch.rand(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)\
+                    * (max_add_mass - min_add_mass) + min_add_mass)
+                self.base_mass = props[0].mass + self.base_add_mass
+            props[0].mass += self.base_add_mass[env_id]
+        else:
+            self.base_mass[:] = props[0].mass
+
+        if self.cfg.domain_rand.randomize_base_com:
+            if env_id == 0:
+                com_x, com_y, com_z = self.cfg.domain_rand.rand_com_vec
+                self.base_com[:, 0] = (
+                    torch.rand(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)\
+                    * (com_x * 2) - com_x)
+                self.base_com[:, 1] = (
+                    torch.rand(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)\
+                    * (com_y * 2) - com_y)
+                self.base_com[:, 2] = (
+                    torch.rand(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)\
+                    * (com_z * 2) - com_z)
+            props[0].com.x += self.base_com[env_id, 0]
+            props[0].com.y += self.base_com[env_id, 1]
+            props[0].com.z += self.base_com[env_id, 2]
+
+        if env_id == 0:
+            self.inertia_scale = torch.ones(
+                self.num_envs,
+                1,
+                dtype=torch.float,
+                device=self.device,
+                requires_grad=False,
+            )
+        if self.cfg.domain_rand.randomize_inertia:
+            low_bound, high_bound = self.cfg.domain_rand.randomize_inertia_range
+            inertia_scales = []
+            for i in range(len(props)):
+                inertia_scale = np.random.uniform(low_bound, high_bound)
+                inertia_scales.append(inertia_scale)
+                props[i].mass *= inertia_scale
+                props[i].inertia.x.x *= inertia_scale
+                props[i].inertia.y.y *= inertia_scale
+                props[i].inertia.z.z *= inertia_scale
+            self.inertia_scale[env_id, 0] = float(np.mean(inertia_scales))
+        return props
+     
     def _post_physics_step_callback(self):
         """Callback called before computing terminations, rewards, and observations
         Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots
@@ -313,6 +456,8 @@ class BipedWF(BaseTask):
 
     def _init_buffers(self):
         super()._init_buffers()
+        self.nominal_p_gains = self._build_nominal_gains(self.cfg.control.stiffness)
+        self.nominal_d_gains = self._build_nominal_gains(self.cfg.control.damping)
         self.wheel_lin_vel = torch.zeros_like(self.foot_velocities)
         self.wheel_ang_vel = torch.zeros_like(self.base_ang_vel)
 
