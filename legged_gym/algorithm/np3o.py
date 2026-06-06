@@ -58,19 +58,15 @@ class NP3O(PPO):
         self.termination_contact_force_threshold = float(termination_contact_force_threshold)
         self.fall_projected_gravity_z = float(fall_projected_gravity_z)
         self.wheel_name_keys = tuple(wheel_name_keys)
+        self.mean_step_cost = torch.tensor(0.0, device=self.device)
+        self.mean_discounted_cost = torch.tensor(0.0, device=self.device)
         self.mean_batch_cost = torch.tensor(0.0, device=self.device)
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape,
                      critic_obs_shape, obs_history_shape, commands_shape, action_shape):
         self.storage = ConstraintRolloutStorage(
-            num_envs,
-            num_transitions_per_env,
-            actor_obs_shape,
-            critic_obs_shape,
-            obs_history_shape,
-            commands_shape,
-            action_shape,
-            self.device,
+            num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape,
+            obs_history_shape, commands_shape, action_shape, self.device,
         )
 
     def _col(self, x, n):
@@ -102,16 +98,19 @@ class NP3O(PPO):
         return torch.tensor(mask, dtype=torch.bool, device=self.device)
 
     def _compute_cost_from_env(self, infos, env):
-        if infos is not None and "cost" in infos:
-            return self._col(infos["cost"], self.num_group)
-        if env is not None and hasattr(env, "cost_buf"):
-            return self._col(env.cost_buf, self.num_group)
         if env is None:
+            if infos is not None and "cost" in infos:
+                return self._col(infos["cost"], self.num_group)
             return torch.zeros(self.num_group, 1, device=self.device)
 
         n = getattr(env, "num_envs", self.num_group)
-        cost = torch.zeros(n, device=self.device)
+        if hasattr(env, "cost_buf"):
+            cost = self._col(env.cost_buf, n).squeeze(-1)
+            if infos is not None:
+                infos["cost"] = cost.detach()
+            return cost.view(n, 1)
 
+        cost = torch.zeros(n, device=self.device)
         dof_pos = getattr(env, "dof_pos", None)
         dof_vel = getattr(env, "dof_vel", None)
         torques = getattr(env, "torques", None)
@@ -120,22 +119,19 @@ class NP3O(PPO):
         tau_lim = getattr(env, "torque_limits", None)
 
         if dof_pos is not None and pos_lim is not None and self.cost_dof_pos_limit > 0.0:
-            dof_pos = dof_pos.to(self.device)
-            pos_lim = pos_lim.to(self.device)
+            dof_pos, pos_lim = dof_pos.to(self.device), pos_lim.to(self.device)
             half = 0.5 * (pos_lim[:, 1] - pos_lim[:, 0])
             excess = torch.clamp(pos_lim[:, 0] - dof_pos, min=0.0) + torch.clamp(dof_pos - pos_lim[:, 1], min=0.0)
             cost += self.cost_dof_pos_limit * torch.sum(excess / self._safe(half), dim=1)
 
         if dof_vel is not None and vel_lim is not None and self.cost_dof_vel_limit > 0.0:
-            dof_vel = dof_vel.to(self.device)
-            vel_lim = vel_lim.to(self.device)
+            dof_vel, vel_lim = dof_vel.to(self.device), vel_lim.to(self.device)
             lim = self._soft(env, "soft_dof_vel_limit", 1.0) * vel_lim
             excess = torch.clamp(torch.abs(dof_vel) - lim, min=0.0)
             cost += self.cost_dof_vel_limit * torch.sum(excess / self._safe(vel_lim), dim=1)
 
         if torques is not None and tau_lim is not None and self.cost_torque_limit > 0.0:
-            torques = torques.to(self.device)
-            tau_lim = tau_lim.to(self.device)
+            torques, tau_lim = torques.to(self.device), tau_lim.to(self.device)
             lim = self._soft(env, "soft_torque_limit", 0.8) * tau_lim
             excess = torch.clamp(torch.abs(torques) - lim, min=0.0)
             cost += self.cost_torque_limit * torch.sum(excess / self._safe(tau_lim), dim=1)
@@ -194,9 +190,11 @@ class NP3O(PPO):
         last_cost_values = self.actor_critic.evaluate_cost(last_critic_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
         self.storage.compute_cost_returns(last_cost_values, self.gamma, self.lam, self.normalize_cost_advantage)
-        self.mean_batch_cost = self.storage.costs.mean().detach()
+        self.mean_step_cost = self.storage.costs.mean().detach()
+        self.mean_discounted_cost = ((1.0 - self.gamma) * self.storage.cost_returns[0].mean()).detach()
+        self.mean_batch_cost = self.mean_discounted_cost
         if self.use_adaptive_penalty:
-            violation = (self.mean_batch_cost - self.cost_limit).item()
+            violation = (self.mean_discounted_cost - self.cost_limit).item()
             self.penalty_coef *= math.exp(self.penalty_lr * violation)
             self.penalty_coef = min(max(self.penalty_coef, self.min_penalty_coef), self.max_penalty_coef)
 
@@ -245,7 +243,8 @@ class NP3O(PPO):
             cost_surr = torch.squeeze(cost_adv_b) * ratio
             cost_surr_clip = torch.squeeze(cost_adv_b) * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
             cost_surrogate_loss = torch.max(cost_surr, cost_surr_clip).mean()
-            penalty_loss = self.penalty_coef * torch.relu(cost_surrogate_loss + self.mean_batch_cost - self.cost_limit)
+            cost_violation = (1.0 - self.gamma) * cost_surrogate_loss + self.mean_discounted_cost - self.cost_limit
+            penalty_loss = self.penalty_coef * torch.relu(cost_violation)
 
             if self.use_clipped_value_loss:
                 value_clip = val_b + (value_b - val_b).clamp(-self.clip_param, self.clip_param)
@@ -281,7 +280,7 @@ class NP3O(PPO):
             mean_cost_value_loss / denom,
             mean_cost_surrogate_loss / denom,
             mean_penalty_loss / denom,
-            self.mean_batch_cost.item(),
+            self.mean_discounted_cost.item(),
             self.penalty_coef,
         )
 
