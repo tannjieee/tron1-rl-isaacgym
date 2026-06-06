@@ -1,31 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
-# 1. Redistributions of source code must retain the above copyright notice, this
-# list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 import numpy as np
@@ -48,6 +23,7 @@ class ActorCritic(nn.Module):
         num_actions,
         actor_hidden_dims=[256, 256, 256],
         critic_hidden_dims=[256, 256, 256],
+        cost_critic_hidden_dims=None,
         activation="elu",
         orthogonal_init=False,
         init_noise_std=1.0,
@@ -86,46 +62,57 @@ class ActorCritic(nn.Module):
                     torch.nn.init.orthogonal_(actor_layers[-1].weight, np.sqrt(2))
                     torch.nn.init.constant_(actor_layers[-1].bias, 0.0)
                 actor_layers.append(activation)
-                # actor_layers.append(torch.nn.LayerNorm(actor_hidden_dims[l + 1]))
         self.actor = nn.Sequential(*actor_layers)
 
-        # Value function
-        critic_layers = []
-        critic_layers.append(nn.Linear(num_critic_obs, critic_hidden_dims[0]))
-        critic_layers.append(activation)
-        for l in range(len(critic_hidden_dims)):
-            if l == len(critic_hidden_dims) - 1:
-                critic_layers.append(nn.Linear(critic_hidden_dims[l], 1))
-                if self.orthogonal_init:
-                    torch.nn.init.orthogonal_(critic_layers[-1].weight, 0.01)
-                    torch.nn.init.constant_(critic_layers[-1].bias, 0.0)
-            else:
-                critic_layers.append(
-                    nn.Linear(critic_hidden_dims[l], critic_hidden_dims[l + 1])
-                )
-                if self.orthogonal_init:
-                    torch.nn.init.orthogonal_(critic_layers[-1].weight, np.sqrt(2))
-                    torch.nn.init.constant_(critic_layers[-1].bias, 0.0)
-                critic_layers.append(activation)
-                # critic_layers.append(torch.nn.LayerNorm(critic_hidden_dims[l + 1]))
+        # Reward value function
+        critic_layers = self._build_value_mlp(
+            num_critic_obs,
+            critic_hidden_dims,
+            activation,
+            orthogonal_init,
+        )
         self.critic = nn.Sequential(*critic_layers)
+
+        # Cost value function for NP3O / P3O. Keeping it inside ActorCritic lets
+        # the checkpoint contain both reward and cost critics and keeps the PPO
+        # optimizer unchanged.
+        if cost_critic_hidden_dims is None:
+            cost_critic_hidden_dims = critic_hidden_dims
+        cost_critic_layers = self._build_value_mlp(
+            num_critic_obs,
+            cost_critic_hidden_dims,
+            activation,
+            orthogonal_init,
+        )
+        self.cost_critic = nn.Sequential(*cost_critic_layers)
 
         print(f"Actor MLP: {self.actor}")
         print(f"Critic MLP: {self.critic}")
+        print(f"Cost critic MLP: {self.cost_critic}")
 
-        # Action noise
-        # self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         self.logstd = nn.Parameter(torch.zeros(num_actions))
         self.distribution = None
-        # disable args validation for speedup
         Normal.set_default_validate_args = False
 
-        # seems that we get better performance without init
-        # self.init_memory_weights(self.memory_a, 0.001, 0.)
-        # self.init_memory_weights(self.memory_c, 0.001, 0.)
+    def _build_value_mlp(self, num_inputs, hidden_dims, activation, orthogonal_init):
+        layers = []
+        layers.append(nn.Linear(num_inputs, hidden_dims[0]))
+        layers.append(activation)
+        for l in range(len(hidden_dims)):
+            if l == len(hidden_dims) - 1:
+                layers.append(nn.Linear(hidden_dims[l], 1))
+                if orthogonal_init:
+                    torch.nn.init.orthogonal_(layers[-1].weight, 0.01)
+                    torch.nn.init.constant_(layers[-1].bias, 0.0)
+            else:
+                layers.append(nn.Linear(hidden_dims[l], hidden_dims[l + 1]))
+                if orthogonal_init:
+                    torch.nn.init.orthogonal_(layers[-1].weight, np.sqrt(2))
+                    torch.nn.init.constant_(layers[-1].bias, 0.0)
+                layers.append(activation)
+        return layers
 
     @staticmethod
-    # not used at the moment
     def init_weights(sequential, scales):
         [
             torch.nn.init.orthogonal_(module.weight, gain=scales[idx])
@@ -170,6 +157,10 @@ class ActorCritic(nn.Module):
     def evaluate(self, critic_observations, **kwargs):
         value = self.critic(critic_observations)
         return value
+
+    def evaluate_cost(self, critic_observations, **kwargs):
+        cost_value = self.cost_critic(critic_observations)
+        return cost_value
 
 
 def get_activation(act_name):
