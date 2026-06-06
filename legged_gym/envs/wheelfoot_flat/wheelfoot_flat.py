@@ -79,6 +79,9 @@ class BipedWF(BaseTask):
         self.fail_buf[env_ids] = 0
         self.action_fifo[env_ids] = 0
         self.dof_pos_int[env_ids] = 0
+        if hasattr(self, "kinematic_utility_target"):
+            self.kinematic_utility_target[env_ids] = 0.0
+            self.last_kinematic_utility[env_ids] = 1.0
         # fill extras
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
@@ -176,6 +179,122 @@ class BipedWF(BaseTask):
     def post_physics_step(self):
         super().post_physics_step()
         self.wheel_lin_vel = self.foot_velocities[:, 0, :] + self.foot_velocities[:, 1, :]
+        self._update_kinematic_utility_target()
+
+    def _get_ku_cfg_value(self, name, default):
+        ku_cfg = getattr(self.cfg, "kinematic_utility", None)
+        return getattr(ku_cfg, name, default) if ku_cfg is not None else default
+
+    def _is_left_dof(self, name):
+        return "_L_" in name or name.endswith("_L_Joint") or "_L" in name
+
+    def _is_right_dof(self, name):
+        return "_R_" in name or name.endswith("_R_Joint") or "_R" in name
+
+    def _dof_indices(self, side="left", include_wheel=False):
+        indices = []
+        for i, name in enumerate(self.dof_names):
+            lname = name.lower()
+            is_side = self._is_left_dof(name) if side == "left" else self._is_right_dof(name)
+            if not is_side:
+                continue
+            is_wheel = "wheel" in lname
+            if include_wheel == is_wheel:
+                indices.append(i)
+        return torch.tensor(indices, dtype=torch.long, device=self.device)
+
+    def _safe_mean_or_one(self, values):
+        if values.numel() == 0:
+            return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
+        return values.mean(dim=-1)
+
+    def _feet_pos_base_frame(self):
+        feet_pos_base = self.foot_positions - self.base_position.unsqueeze(1).repeat(1, len(self.feet_indices), 1)
+        for i in range(len(self.feet_indices)):
+            feet_pos_base[:, i, :] = quat_rotate_inverse(self.base_quat, feet_pos_base[:, i, :])
+        return feet_pos_base
+
+    def _feet_vel_base_frame(self):
+        feet_vel_base = self.foot_velocities.clone()
+        for i in range(len(self.feet_indices)):
+            feet_vel_base[:, i, :] = quat_rotate_inverse(self.base_quat, feet_vel_base[:, i, :])
+        return feet_vel_base
+
+    def _compute_leg_joint_margin_utility(self, dof_ids):
+        if dof_ids.numel() == 0:
+            return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
+        q = self.dof_pos[:, dof_ids]
+        lower = self.dof_pos_limits[dof_ids, 0].unsqueeze(0)
+        upper = self.dof_pos_limits[dof_ids, 1].unsqueeze(0)
+        half_range = torch.clamp(0.5 * (upper - lower), min=1.0e-6)
+        normalized_margin = torch.minimum(q - lower, upper - q) / half_range
+        margin_floor = float(self._get_ku_cfg_value("joint_margin_floor", 0.08))
+        margin_temp = float(self._get_ku_cfg_value("joint_margin_temp", 0.04))
+        utility_per_joint = torch.sigmoid((normalized_margin - margin_floor) / margin_temp)
+        return torch.clamp(utility_per_joint.min(dim=-1).values, 0.0, 1.0)
+
+    def _compute_workspace_utility(self, side_index):
+        feet_pos_base = self._feet_pos_base_frame()
+        foot_pos = feet_pos_base[:, side_index, :]
+        nominal = self.ku_nominal_foot_pos_base[:, side_index, :]
+        x_scale = float(self._get_ku_cfg_value("workspace_x_scale", 0.35))
+        y_scale = float(self._get_ku_cfg_value("workspace_y_scale", 0.12))
+        z_scale = float(self._get_ku_cfg_value("workspace_z_scale", 0.18))
+        err = torch.stack(
+            (
+                (foot_pos[:, 0] - nominal[:, 0]) / x_scale,
+                (foot_pos[:, 1] - nominal[:, 1]) / y_scale,
+                (foot_pos[:, 2] - nominal[:, 2]) / z_scale,
+            ),
+            dim=-1,
+        )
+        return torch.exp(-torch.sum(torch.square(err), dim=-1)).clamp(0.0, 1.0)
+
+    def _compute_roll_consistency_utility(self, side_index, wheel_dof_ids):
+        if wheel_dof_ids.numel() == 0:
+            return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
+        feet_vel_base = self._feet_vel_base_frame()
+        wheel_center_vx = feet_vel_base[:, side_index, 0]
+        wheel_speed = self.dof_vel[:, wheel_dof_ids[0]] * self.cfg.asset.foot_radius
+        # The wheel joint sign can differ between URDF conventions, so use the smaller
+        # of the two signed rolling residuals as a sign-invariant slip proxy.
+        residual_same = torch.abs(wheel_center_vx - wheel_speed)
+        residual_flip = torch.abs(wheel_center_vx + wheel_speed)
+        residual = torch.minimum(residual_same, residual_flip)
+        sigma = float(self._get_ku_cfg_value("roll_consistency_sigma", 0.35))
+        return torch.exp(-torch.square(residual / sigma)).clamp(0.0, 1.0)
+
+    def _update_kinematic_utility_target(self):
+        if not hasattr(self, "kinematic_utility_target"):
+            return
+        left_joint_u = self._compute_leg_joint_margin_utility(self.left_leg_dof_ids)
+        right_joint_u = self._compute_leg_joint_margin_utility(self.right_leg_dof_ids)
+        left_workspace_u = self._compute_workspace_utility(0)
+        right_workspace_u = self._compute_workspace_utility(1)
+        left_roll_u = self._compute_roll_consistency_utility(0, self.left_wheel_dof_ids)
+        right_roll_u = self._compute_roll_consistency_utility(1, self.right_wheel_dof_ids)
+
+        left_k = (left_joint_u * left_workspace_u * left_roll_u).clamp(0.0, 1.0)
+        right_k = (right_joint_u * right_workspace_u * right_roll_u).clamp(0.0, 1.0)
+        k_pair = torch.stack((left_k, right_k), dim=-1)
+        dk_pair = (k_pair - self.last_kinematic_utility) / max(self.dt, 1.0e-6)
+        dk_scale = float(self._get_ku_cfg_value("dku_scale", 5.0))
+        dk_pair = torch.clamp(dk_pair / dk_scale, -1.0, 1.0)
+
+        self.kinematic_utility_target = torch.cat(
+            (
+                k_pair,
+                torch.stack((left_joint_u, right_joint_u), dim=-1),
+                torch.stack((left_workspace_u, right_workspace_u), dim=-1),
+                torch.stack((left_roll_u, right_roll_u), dim=-1),
+                (left_k - right_k).unsqueeze(-1),
+                dk_pair,
+            ),
+            dim=-1,
+        )
+        self.last_kinematic_utility = k_pair.detach()
+        self.extras["ku_target"] = self.kinematic_utility_target.detach()
+        self.extras["ku_mean"] = k_pair.mean(dim=0).detach()
 
     def _build_nominal_gains(self, gain_cfg):
         nominal_gains = torch.zeros(
@@ -601,6 +720,26 @@ class BipedWF(BaseTask):
         self.nominal_d_gains = self._build_nominal_gains(self.cfg.control.damping)
         self.wheel_lin_vel = torch.zeros_like(self.foot_velocities)
         self.wheel_ang_vel = torch.zeros_like(self.base_ang_vel)
+        self.left_leg_dof_ids = self._dof_indices(side="left", include_wheel=False)
+        self.right_leg_dof_ids = self._dof_indices(side="right", include_wheel=False)
+        self.left_wheel_dof_ids = self._dof_indices(side="left", include_wheel=True)
+        self.right_wheel_dof_ids = self._dof_indices(side="right", include_wheel=True)
+        self.ku_target_dim = 11
+        self.kinematic_utility_target = torch.zeros(
+            self.num_envs,
+            self.ku_target_dim,
+            dtype=torch.float,
+            device=self.device,
+            requires_grad=False,
+        )
+        self.last_kinematic_utility = torch.ones(
+            self.num_envs,
+            2,
+            dtype=torch.float,
+            device=self.device,
+            requires_grad=False,
+        )
+        self.ku_nominal_foot_pos_base = self._feet_pos_base_frame().detach().clone()
 
     # ------------ reward functions----------------
 
