@@ -29,6 +29,7 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 import os
+import inspect
 from datetime import datetime
 from typing import Tuple
 import torch
@@ -93,14 +94,16 @@ class TaskRegistry:
         with open(file, "w") as json_file:
             json_file.write(json_str)
 
-        save_items = [
-            os.path.join(LEGGED_GYM_ENVS_DIR + "/{}/".format(name) + "{}.py".format(name)),
-            os.path.join(LEGGED_GYM_ENVS_DIR + "/{}/".format(name) + "{}_config.py".format(name))
-        ]
-        if save_items is not None:
-            for save_item in save_items:
-                base_file_name = ntpath.basename(save_item)
-                copyfile(save_item, self.log_dir + "/" + base_file_name)
+        save_items = []
+        for item in (self.task_classes[name], self.env_cfgs[name], self.train_cfgs[name]):
+            source_obj = item if inspect.isclass(item) else item.__class__
+            source_file = inspect.getsourcefile(source_obj)
+            if source_file is not None and os.path.isfile(source_file):
+                save_items.append(source_file)
+
+        for save_item in dict.fromkeys(save_items):
+            base_file_name = ntpath.basename(save_item)
+            copyfile(save_item, os.path.join(self.log_dir, base_file_name))
 
     def make_env(self, name, args=None, env_cfg=None):
         """Creates an environment either from a registered namme or from the provided config file.

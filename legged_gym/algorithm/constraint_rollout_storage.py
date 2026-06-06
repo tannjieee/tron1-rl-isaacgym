@@ -4,17 +4,22 @@ from .rollout_storage import RolloutStorage
 
 
 class ConstraintRolloutStorage(RolloutStorage):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, cost_shape=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.costs = torch.zeros_like(self.rewards)
-        self.cost_values = torch.zeros_like(self.values)
-        self.cost_returns = torch.zeros_like(self.returns)
-        self.cost_advantages = torch.zeros_like(self.advantages)
+        if cost_shape is None:
+            cost_shape = [1]
+        self.cost_shape = cost_shape
+        self.costs = torch.zeros(
+            self.num_transitions_per_env, self.num_envs, *cost_shape, device=self.device
+        )
+        self.cost_values = torch.zeros_like(self.costs)
+        self.cost_returns = torch.zeros_like(self.costs)
+        self.cost_advantages = torch.zeros_like(self.costs)
 
     def add_transitions(self, transition):
         step = self.step
         if getattr(transition, "costs", None) is not None:
-            self.costs[step].copy_(transition.costs.view(-1, 1))
+            self.costs[step].copy_(transition.costs.view(self.num_envs, *self.cost_shape))
         if getattr(transition, "cost_values", None) is not None:
             self.cost_values[step].copy_(transition.cost_values)
         super().add_transitions(transition)
@@ -32,7 +37,9 @@ class ConstraintRolloutStorage(RolloutStorage):
             self.cost_returns[step] = advantage + self.cost_values[step]
         self.cost_advantages = self.cost_returns - self.cost_values
         if normalize:
-            self.cost_advantages = (self.cost_advantages - self.cost_advantages.mean()) / (self.cost_advantages.std() + 1e-8)
+            mean = self.cost_advantages.mean(dim=(0, 1), keepdim=True)
+            std = self.cost_advantages.std(dim=(0, 1), keepdim=True)
+            self.cost_advantages = (self.cost_advantages - mean) / (std + 1e-8)
 
     def _flat(self, tensor, group_idx):
         return tensor[:, group_idx, :].flatten(0, 1)

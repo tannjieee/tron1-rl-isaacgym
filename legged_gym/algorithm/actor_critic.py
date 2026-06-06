@@ -24,6 +24,7 @@ class ActorCritic(nn.Module):
         actor_hidden_dims=[256, 256, 256],
         critic_hidden_dims=[256, 256, 256],
         cost_critic_hidden_dims=None,
+        num_costs=1,
         activation="elu",
         orthogonal_init=False,
         init_noise_std=1.0,
@@ -39,6 +40,7 @@ class ActorCritic(nn.Module):
         self.orthogonal_init = orthogonal_init
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
+        self.num_costs = max(int(num_costs), 1)
 
         activation = get_activation(activation)
 
@@ -83,6 +85,7 @@ class ActorCritic(nn.Module):
             cost_critic_hidden_dims,
             activation,
             orthogonal_init,
+            output_dim=self.num_costs,
         )
         self.cost_critic = nn.Sequential(*cost_critic_layers)
 
@@ -94,13 +97,13 @@ class ActorCritic(nn.Module):
         self.distribution = None
         Normal.set_default_validate_args = False
 
-    def _build_value_mlp(self, num_inputs, hidden_dims, activation, orthogonal_init):
+    def _build_value_mlp(self, num_inputs, hidden_dims, activation, orthogonal_init, output_dim=1):
         layers = []
         layers.append(nn.Linear(num_inputs, hidden_dims[0]))
         layers.append(activation)
         for l in range(len(hidden_dims)):
             if l == len(hidden_dims) - 1:
-                layers.append(nn.Linear(hidden_dims[l], 1))
+                layers.append(nn.Linear(hidden_dims[l], output_dim))
                 if orthogonal_init:
                     torch.nn.init.orthogonal_(layers[-1].weight, 0.01)
                     torch.nn.init.constant_(layers[-1].bias, 0.0)

@@ -21,12 +21,12 @@ from legged_gym.utils.math import (
     wrap_to_pi,
     torch_rand_sqrt_float,
 )
-from .wheelfoot_flat_config import BipedCfgWF
+from legged_gym.envs.base.base_config import BaseConfig
 from legged_gym.utils.helpers import class_to_dict
 
 class BipedWF(BaseTask):
     def __init__(
-        self, cfg: BipedCfgWF, sim_params, physics_engine, sim_device, headless
+        self, cfg: BaseConfig, sim_params, physics_engine, sim_device, headless
     ):
         self.cfg = cfg
         self.sim_params = sim_params
@@ -42,6 +42,7 @@ class BipedWF(BaseTask):
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
         self._init_buffers()
         self._prepare_reward_function()
+        self._prepare_cost_function()
         self.init_done = True
 
     def reset_idx(self, env_ids):
@@ -85,6 +86,11 @@ class BipedWF(BaseTask):
                 torch.mean(self.episode_sums[key][env_ids]) / self.max_episode_length_s
             )
             self.episode_sums[key][env_ids] = 0.0
+        for key in self.cost_episode_sums.keys():
+            self.extras["episode"]["cost_" + key] = (
+                torch.mean(self.cost_episode_sums[key][env_ids]) / self.max_episode_length_s
+            )
+            self.cost_episode_sums[key][env_ids] = 0.0
         # log additional curriculum info
         if self.cfg.terrain.curriculum:
             self.extras["episode"]["group_terrain_level"] = torch.mean(
@@ -257,6 +263,141 @@ class BipedWF(BaseTask):
             ),
             dim=-1,
         )
+
+    def _prepare_cost_function(self):
+        costs_cfg = getattr(self.cfg, "costs", None)
+        if costs_cfg is None:
+            self.cost_scales = {}
+            self.cost_d_values = {}
+            self.cost_names = []
+            self.cost_functions = []
+            self.num_costs = 0
+            self.cost_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            self.cost_terms_buf = torch.zeros(self.num_envs, 0, dtype=torch.float, device=self.device)
+            self.cost_episode_sums = {}
+            self.cost_k_values = torch.zeros(1, 0, dtype=torch.float, device=self.device)
+            self.cost_d_values_tensor = torch.zeros(1, 1, 0, dtype=torch.float, device=self.device)
+            return
+
+        self.cost_scales = class_to_dict(getattr(costs_cfg, "scales", {}))
+        self.cost_d_values = class_to_dict(getattr(costs_cfg, "d_values", {}))
+        self.cost_names = []
+        self.cost_functions = []
+        self.cost_k_values = []
+        self.cost_d_values_tensor = []
+        for name, scale in list(self.cost_scales.items()):
+            if scale == 0:
+                self.cost_scales.pop(name)
+                continue
+            function_name = "_cost_" + name
+            if not hasattr(self, function_name):
+                raise AttributeError(f"Cost '{name}' is configured but {function_name} is not implemented")
+            self.cost_names.append(name)
+            self.cost_functions.append(getattr(self, function_name))
+            self.cost_k_values.append(float(scale))
+            self.cost_d_values_tensor.append(float(self.cost_d_values.get(name, 0.0)))
+
+        self.num_costs = len(self.cost_names)
+        self.cost_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.cost_terms_buf = torch.zeros(
+            self.num_envs,
+            self.num_costs,
+            dtype=torch.float,
+            device=self.device,
+        )
+        self.cost_episode_sums = {
+            name: torch.zeros(
+                self.num_envs,
+                dtype=torch.float,
+                device=self.device,
+                requires_grad=False,
+            )
+            for name in self.cost_names
+        }
+        self.cost_k_values = torch.tensor(
+            self.cost_k_values,
+            dtype=torch.float,
+            device=self.device,
+        ).view(1, -1)
+        self.cost_d_values_tensor = torch.tensor(
+            self.cost_d_values_tensor,
+            dtype=torch.float,
+            device=self.device,
+        ).view(1, 1, -1)
+
+    def compute_cost(self):
+        self.cost_buf[:] = 0.0
+        if len(self.cost_functions) == 0:
+            return
+
+        use_dt = bool(getattr(self.cfg.costs, "use_dt", True))
+        dt_scale = self.dt if use_dt else 1.0
+        for i, function in enumerate(self.cost_functions):
+            name = self.cost_names[i]
+            cost = function() * dt_scale
+            self.cost_terms_buf[:, i] = cost
+            self.cost_buf += cost
+            self.cost_episode_sums[name] += cost
+
+        self.extras["cost"] = self.cost_buf.detach()
+        self.extras["cost_terms"] = self.cost_terms_buf.detach()
+
+    def _safe_limit(self, value):
+        return torch.clamp(torch.abs(value), min=1.0e-6)
+
+    def _wheel_dof_mask(self):
+        name_keys = getattr(self.cfg.costs, "wheel_name_keys", ["wheel"])
+        return torch.tensor(
+            [
+                any(key.lower() in name.lower() for key in name_keys)
+                for name in self.dof_names
+            ],
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+    def _cost_dof_pos_limit(self):
+        half_range = 0.5 * (self.dof_pos_limits[:, 1] - self.dof_pos_limits[:, 0])
+        out_of_limits = torch.clamp(self.dof_pos_limits[:, 0] - self.dof_pos, min=0.0)
+        out_of_limits += torch.clamp(self.dof_pos - self.dof_pos_limits[:, 1], min=0.0)
+        return torch.sum(out_of_limits / self._safe_limit(half_range), dim=1)
+
+    def _cost_dof_vel_limit(self):
+        limit = self.dof_vel_limits * self.cfg.rewards.soft_dof_vel_limit
+        excess = torch.clamp(torch.abs(self.dof_vel) - limit, min=0.0)
+        return torch.sum(excess / self._safe_limit(self.dof_vel_limits), dim=1)
+
+    def _cost_torque_limit(self):
+        limit = self.torque_limits * self.cfg.rewards.soft_torque_limit
+        excess = torch.clamp(torch.abs(self.torques) - limit, min=0.0)
+        return torch.sum(excess / self._safe_limit(self.torque_limits), dim=1)
+
+    def _cost_wheel_vel_limit(self):
+        mask = self._wheel_dof_mask()
+        if not torch.any(mask):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        excess = torch.clamp(torch.abs(self.dof_vel[:, mask]) - self.dof_vel_limits[mask], min=0.0)
+        return torch.sum(excess / self._safe_limit(self.dof_vel_limits[mask]), dim=1)
+
+    def _cost_collision(self):
+        threshold = self.cfg.costs.contact_force_threshold
+        return torch.sum(
+            torch.norm(self.contact_forces[:, self.penalised_contact_indices, :], dim=-1) > threshold,
+            dim=1,
+        ).float()
+
+    def _cost_termination_contact(self):
+        threshold = self.cfg.costs.termination_contact_force_threshold
+        return torch.any(
+            torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > threshold,
+            dim=1,
+        ).float()
+
+    def _cost_fall(self):
+        return (self.projected_gravity[:, 2] > self.cfg.costs.fall_projected_gravity_z).float()
+
+    def _cost_power_limit(self):
+        return self.power_limit_out_buf.float()
 
     def compute_group_observations(self):
         # note that observation noise need to modified accordingly !!!

@@ -210,6 +210,10 @@ class BaseTask:
             rew = self._reward_termination() * self.reward_scales["termination"]
             self.rew_buf += rew
             self.episode_sums["termination"] += rew
+
+    def compute_cost(self):
+        """Compute constraint costs when an environment defines them."""
+        pass
             
     def create_sim(self):
         """Creates simulation, terrain and evironments"""
@@ -1157,6 +1161,7 @@ class BaseTask:
         # compute observations, rewards, resets, ...
         self.check_termination()
         self.compute_reward()
+        self.compute_cost()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
         self.compute_observations()  # in some cases a simulation step might be required to refresh some obs (for example body positions)

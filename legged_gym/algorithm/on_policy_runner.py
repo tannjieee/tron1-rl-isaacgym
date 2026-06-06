@@ -28,6 +28,8 @@ class OnPolicyRunner:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+        self.num_costs = max(int(getattr(self.env, "num_costs", 1)), 1)
+        self.policy_cfg["num_costs"] = self.num_costs
 
         encoder = eval(self.cfg["encoder_class_name"])(
             **self.ecd_cfg,
@@ -46,12 +48,16 @@ class OnPolicyRunner:
         ).to(self.device)
 
         alg_class = eval(self.cfg["algorithm_class_name"])
+        alg_cfg = dict(self.alg_cfg)
+        if self.cfg["algorithm_class_name"] == "NP3O":
+            alg_cfg["cost_k_values"] = getattr(self.env, "cost_k_values", None)
+            alg_cfg["cost_d_values"] = getattr(self.env, "cost_d_values_tensor", None)
         self.alg = alg_class(
             self.env.num_envs,
             encoder,
             actor_critic,
             device=self.device,
-            **self.alg_cfg,
+            **alg_cfg,
         )
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
