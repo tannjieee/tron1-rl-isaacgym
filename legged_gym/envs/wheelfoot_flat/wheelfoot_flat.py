@@ -475,49 +475,6 @@ class BipedWF(BaseTask):
             device=self.device,
         )
 
-    def _cost_dof_pos_limit(self):
-        half_range = 0.5 * (self.dof_pos_limits[:, 1] - self.dof_pos_limits[:, 0])
-        out_of_limits = torch.clamp(self.dof_pos_limits[:, 0] - self.dof_pos, min=0.0)
-        out_of_limits += torch.clamp(self.dof_pos - self.dof_pos_limits[:, 1], min=0.0)
-        return torch.sum(out_of_limits / self._safe_limit(half_range), dim=1)
-
-    def _cost_dof_vel_limit(self):
-        limit = self.dof_vel_limits * self.cfg.rewards.soft_dof_vel_limit
-        excess = torch.clamp(torch.abs(self.dof_vel) - limit, min=0.0)
-        return torch.sum(excess / self._safe_limit(self.dof_vel_limits), dim=1)
-
-    def _cost_torque_limit(self):
-        limit = self.torque_limits * self.cfg.rewards.soft_torque_limit
-        excess = torch.clamp(torch.abs(self.torques) - limit, min=0.0)
-        return torch.sum(excess / self._safe_limit(self.torque_limits), dim=1)
-
-    def _cost_wheel_vel_limit(self):
-        mask = self._wheel_dof_mask()
-        if not torch.any(mask):
-            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-        excess = torch.clamp(torch.abs(self.dof_vel[:, mask]) - self.dof_vel_limits[mask], min=0.0)
-        return torch.sum(excess / self._safe_limit(self.dof_vel_limits[mask]), dim=1)
-
-    def _cost_collision(self):
-        threshold = self.cfg.costs.contact_force_threshold
-        return torch.sum(
-            torch.norm(self.contact_forces[:, self.penalised_contact_indices, :], dim=-1) > threshold,
-            dim=1,
-        ).float()
-
-    def _cost_termination_contact(self):
-        threshold = self.cfg.costs.termination_contact_force_threshold
-        return torch.any(
-            torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > threshold,
-            dim=1,
-        ).float()
-
-    def _cost_fall(self):
-        return (self.projected_gravity[:, 2] > self.cfg.costs.fall_projected_gravity_z).float()
-
-    def _cost_power_limit(self):
-        return self.power_limit_out_buf.float()
-
     def compute_group_observations(self):
         # note that observation noise need to modified accordingly !!!
         dof_list = [0,1,2,4,5,6]
@@ -864,3 +821,48 @@ class BipedWF(BaseTask):
         # Penalize base height away from target
         base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
         return torch.abs(base_height - self.cfg.rewards.base_height_target)
+
+    # ------------ cost functions----------------
+
+    def _cost_dof_pos_limit(self):
+        half_range = 0.5 * (self.dof_pos_limits[:, 1] - self.dof_pos_limits[:, 0])
+        out_of_limits = torch.clamp(self.dof_pos_limits[:, 0] - self.dof_pos, min=0.0)
+        out_of_limits += torch.clamp(self.dof_pos - self.dof_pos_limits[:, 1], min=0.0)
+        return torch.sum(out_of_limits / self._safe_limit(half_range), dim=1)
+
+    def _cost_dof_vel_limit(self):
+        limit = self.dof_vel_limits * self.cfg.rewards.soft_dof_vel_limit
+        excess = torch.clamp(torch.abs(self.dof_vel) - limit, min=0.0)
+        return torch.sum(excess / self._safe_limit(self.dof_vel_limits), dim=1)
+
+    def _cost_torque_limit(self):
+        limit = self.torque_limits * self.cfg.rewards.soft_torque_limit
+        excess = torch.clamp(torch.abs(self.torques) - limit, min=0.0)
+        return torch.sum(excess / self._safe_limit(self.torque_limits), dim=1)
+
+    def _cost_wheel_vel_limit(self):
+        mask = self._wheel_dof_mask()
+        if not torch.any(mask):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        excess = torch.clamp(torch.abs(self.dof_vel[:, mask]) - self.dof_vel_limits[mask], min=0.0)
+        return torch.sum(excess / self._safe_limit(self.dof_vel_limits[mask]), dim=1)
+
+    def _cost_collision(self):
+        threshold = self.cfg.costs.contact_force_threshold
+        return torch.sum(
+            torch.norm(self.contact_forces[:, self.penalised_contact_indices, :], dim=-1) > threshold,
+            dim=1,
+        ).float()
+
+    def _cost_termination_contact(self):
+        threshold = self.cfg.costs.termination_contact_force_threshold
+        return torch.any(
+            torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > threshold,
+            dim=1,
+        ).float()
+
+    def _cost_fall(self):
+        return (self.projected_gravity[:, 2] > self.cfg.costs.fall_projected_gravity_z).float()
+
+    def _cost_power_limit(self):
+        return self.power_limit_out_buf.float()
