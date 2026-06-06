@@ -278,6 +278,30 @@ class BipedCfgWF(BaseConfig):
             power_limit = 0.0
             wheel_vel_limit = 0.0
 
+    class kinematic_utility:
+        # The environment computes this as a training/logging target only.
+        # It is not appended to actor observations and is not used as a hard gait trigger.
+        enable = True
+        target_dim = 11
+
+        # Joint-limit margin utility. Values are normalized by each joint half range.
+        joint_margin_floor = 0.08
+        joint_margin_temp = 0.04
+
+        # Workspace utility around the reset/default wheel-foot location in base frame.
+        # These are robot-scale parameters, not terrain/event thresholds.
+        workspace_x_scale = 0.35
+        workspace_y_scale = 0.12
+        workspace_z_scale = 0.18
+
+        # Rolling consistency utility: compares wheel-center forward velocity in base
+        # frame with wheel angular velocity times wheel radius. The implementation is
+        # sign-invariant because URDF wheel joint signs may differ between sides.
+        roll_consistency_sigma = 0.35
+
+        # dK normalization used only for the final two target channels.
+        dku_scale = 5.0
+
     class normalization:
         class obs_scales:
             lin_vel = 2.0
