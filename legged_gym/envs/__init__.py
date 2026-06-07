@@ -62,7 +62,7 @@ from legged_gym.utils.task_registry import task_registry
 #     task_registry.register("pointfoot_flat", BipedWF, BipedCfgWF(), BipedCfgPPOWF())
 
 # elif robot_type == "WF_TRON1A_NP3O":
-from legged_gym.envs.wheelfoot_flat.wheelfoot_vicreg_inputs import BipedWF
+from legged_gym.envs.wheelfoot_flat.wheelfoot_flat import BipedWF
 from legged_gym.envs.wheelfoot_flat.wheelfoot_np3o_config import BipedCfgWF, BipedCfgNP3OWF
 task_registry.register("pointfoot_flat", BipedWF, BipedCfgWF(), BipedCfgNP3OWF())
 
