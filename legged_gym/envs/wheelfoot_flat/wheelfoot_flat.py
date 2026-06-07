@@ -76,10 +76,29 @@ class BipedWF(BaseTask):
         # self.obs_history[env_ids] = 0
         # obs_buf, _ = self.compute_group_observations()
         # self.obs_history[env_ids] = obs_buf[env_ids].repeat(1, self.obs_history_length)
+        # self.obs_history[env_ids] = 0
+        # self.obs_history_clean[env_ids] = 0
+        # self.vicreg_obs_history_view1[env_ids] = 0
+        # self.vicreg_obs_history_view2[env_ids] = 0
+        # obs_buf, _ = self.compute_group_observations()
+        # obs_buf = self._apply_randomized_imu_offset_to_obs(obs_buf.clone())
+        # obs_buf_noisy = self._add_independent_obs_noise(obs_buf)
+        # self.obs_history_clean[env_ids] = obs_buf[env_ids].repeat(
+        #     1, self.obs_history_length
+        # )
+        # self.obs_history[env_ids] = obs_buf_noisy[env_ids].repeat(
+        #     1, self.obs_history_length
+        # )
+        # (
+        #     self.vicreg_obs_history_view1,
+        #     self.vicreg_obs_history_view2,
+        # ) = self._make_vicreg_history_views(self.obs_history_clean)
         self.obs_history[env_ids] = 0
-        self.obs_history_clean[env_ids] = 0
-        self.vicreg_obs_history_view1[env_ids] = 0
-        self.vicreg_obs_history_view2[env_ids] = 0
+        if hasattr(self, "obs_history_clean"):
+            self.obs_history_clean[env_ids] = 0
+        if hasattr(self, "vicreg_obs_history_view1"):
+            self.vicreg_obs_history_view1[env_ids] = 0
+            self.vicreg_obs_history_view2[env_ids] = 0
         obs_buf, _ = self.compute_group_observations()
         obs_buf = self._apply_randomized_imu_offset_to_obs(obs_buf.clone())
         obs_buf_noisy = self._add_independent_obs_noise(obs_buf)
@@ -89,10 +108,9 @@ class BipedWF(BaseTask):
         self.obs_history[env_ids] = obs_buf_noisy[env_ids].repeat(
             1, self.obs_history_length
         )
-        (
-            self.vicreg_obs_history_view1,
-            self.vicreg_obs_history_view2,
-        ) = self._make_vicreg_history_views(self.obs_history_clean)
+        view1, view2 = self._make_vicreg_history_views(self.obs_history_clean)
+        self.vicreg_obs_history_view1[env_ids] = view1[env_ids]
+        self.vicreg_obs_history_view2[env_ids] = view2[env_ids]
         
         self.gait_indices[env_ids] = 0
         self.fail_buf[env_ids] = 0
