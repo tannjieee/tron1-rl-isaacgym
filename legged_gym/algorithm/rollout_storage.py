@@ -31,6 +31,7 @@
 import torch
 import numpy as np
 
+
 class RolloutStorage:
     class Transition:
         def __init__(self):
@@ -38,6 +39,8 @@ class RolloutStorage:
             self.next_observations = None
             self.critic_obs = None
             self.observation_history = None
+            self.vicreg_view1 = None
+            self.vicreg_view2 = None
             self.commands = None
             self.actions = None
             self.rewards = None
@@ -79,13 +82,18 @@ class RolloutStorage:
                 num_transitions_per_env,
                 num_envs,
                 *all_obs_shape,
-                device=self.device
+                device=self.device,
             )
         else:
             self.critic_obs = None
         self.observation_history = torch.zeros(
             num_transitions_per_env, num_envs, *obs_history_shape, device=self.device
         )
+        # Two augmented history windows used only by encoder auxiliary training.
+        # They are kept separate from observation_history so PPO still consumes the
+        # same noisy deployment history while VICReg can use paired views.
+        self.vicreg_view1 = torch.zeros_like(self.observation_history)
+        self.vicreg_view2 = torch.zeros_like(self.observation_history)
         self.commands = torch.zeros(
             num_transitions_per_env, num_envs, *commands_shape, device=self.device
         )
@@ -98,7 +106,7 @@ class RolloutStorage:
         self.dones = torch.zeros(
             num_transitions_per_env, num_envs, 1, device=self.device
         ).byte()
-        
+
         # For PPO
         self.actions_log_prob = torch.zeros(
             num_transitions_per_env, num_envs, 1, device=self.device
@@ -136,6 +144,18 @@ class RolloutStorage:
         if self.critic_obs is not None:
             self.critic_obs[self.step].copy_(transition.critic_obs)
         self.observation_history[self.step].copy_(transition.observation_history)
+
+        # Fall back to the actual policy history when the environment does not
+        # expose VICReg views. This keeps older environments compatible.
+        view1 = transition.vicreg_view1
+        view2 = transition.vicreg_view2
+        if view1 is None:
+            view1 = transition.observation_history
+        if view2 is None:
+            view2 = transition.observation_history
+        self.vicreg_view1[self.step].copy_(view1)
+        self.vicreg_view2[self.step].copy_(view2)
+
         self.commands[self.step].copy_(transition.commands)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
@@ -232,7 +252,7 @@ class RolloutStorage:
             requires_grad=False,
             device=self.device,
         )
-        group_group_idx = torch.arange(0, num_group)
+        group_group_idx = torch.arange(0, num_group, device=self.device)
         group_observations = self.observations[:, group_group_idx, :].flatten(0, 1)
 
         group_critic_obs = self.critic_obs[:, group_group_idx, :].flatten(0, 1)
@@ -258,7 +278,7 @@ class RolloutStorage:
                 obs_batch = group_obs_batch
                 group_critic_obs_batch = group_critic_obs[group_batch_idx]
                 critic_obs_batch = group_critic_obs_batch
-                
+
                 group_obs_history_batch = group_obs_history[group_batch_idx]
                 obs_history_batch = group_obs_history_batch
 
@@ -300,6 +320,8 @@ class RolloutStorage:
         else:
             critic_obs = observations
         obs_history = self.observation_history.flatten(0, 1)
+        vicreg_view1 = self.vicreg_view1.flatten(0, 1)
+        vicreg_view2 = self.vicreg_view2.flatten(0, 1)
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -310,4 +332,12 @@ class RolloutStorage:
                 next_obs_batch = next_observations[batch_idx]
                 critic_obs_batch = critic_obs[batch_idx]
                 obs_history_batch = obs_history[batch_idx]
-                yield next_obs_batch, critic_obs_batch, obs_history_batch
+                vicreg_view1_batch = vicreg_view1[batch_idx]
+                vicreg_view2_batch = vicreg_view2[batch_idx]
+                yield (
+                    next_obs_batch,
+                    critic_obs_batch,
+                    obs_history_batch,
+                    vicreg_view1_batch,
+                    vicreg_view2_batch,
+                )
