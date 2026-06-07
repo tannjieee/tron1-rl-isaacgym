@@ -31,6 +31,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 
 from .mlp_encoder import MLP_Encoder
 from .actor_critic import ActorCritic
@@ -64,6 +65,13 @@ class PPO:
         critic_take_latent=False,
         early_stop=False,
         anneal_lr=False,
+        encoder_explicit_dim=3,
+        mse_loss_coef=1.0,
+        vicreg_loss_coef=0.05,
+        vicreg_sim_coef=25.0,
+        vicreg_std_coef=25.0,
+        vicreg_cov_coef=1.0,
+        vicreg_eps=1.0e-4,
         device="cpu",
     ):
         self.device = device
@@ -78,6 +86,14 @@ class PPO:
         self.critic_take_latent = critic_take_latent
 
         self.encoder = encoder
+        self.encoder_explicit_dim = int(max(0, encoder_explicit_dim))
+        self.encoder_explicit_dim = min(self.encoder_explicit_dim, self.encoder.num_output_dim)
+        self.mse_loss_coef = float(mse_loss_coef)
+        self.vicreg_loss_coef = float(vicreg_loss_coef)
+        self.vicreg_sim_coef = float(vicreg_sim_coef)
+        self.vicreg_std_coef = float(vicreg_std_coef)
+        self.vicreg_cov_coef = float(vicreg_cov_coef)
+        self.vicreg_eps = float(vicreg_eps)
 
         # PPO components
         self.actor_critic = actor_critic
@@ -131,9 +147,10 @@ class PPO:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, obs_history, commands, critic_obs):
+    def act(self, obs, obs_history, commands, critic_obs, vicreg_view1=None, vicreg_view2=None):
         critic_obs = torch.cat((critic_obs, commands), dim=-1)
-        # act
+        # act. The encoder output is detached here by design; the encoder is
+        # optimized only by the explicit privileged MSE and VICReg objectives.
         encoder_out = self.encoder.encode(obs_history)
         self.transition.actions = self.actor_critic.act(
             torch.cat((encoder_out, obs, commands), dim=-1)
@@ -154,6 +171,8 @@ class PPO:
         self.transition.observations = obs
         self.transition.critic_obs = critic_obs
         self.transition.observation_history = obs_history
+        self.transition.vicreg_view1 = vicreg_view1
+        self.transition.vicreg_view2 = vicreg_view2
         self.transition.commands = commands
         return self.transition.actions
 
@@ -177,6 +196,61 @@ class PPO:
     def compute_returns(self, last_critic_obs):
         last_values = self.actor_critic.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
+
+    @staticmethod
+    def _off_diagonal(x):
+        n, m = x.shape
+        if n != m:
+            raise ValueError("off-diagonal extraction expects a square matrix")
+        return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+    def _vicreg_loss(self, z1, z2):
+        if z1.shape[1] == 0:
+            return torch.zeros((), dtype=z1.dtype, device=z1.device)
+        if z1.shape[0] <= 1:
+            return F.mse_loss(z1, z2)
+
+        repr_loss = F.mse_loss(z1, z2)
+
+        z1 = z1 - z1.mean(dim=0)
+        z2 = z2 - z2.mean(dim=0)
+        std_z1 = torch.sqrt(z1.var(dim=0, unbiased=False) + self.vicreg_eps)
+        std_z2 = torch.sqrt(z2.var(dim=0, unbiased=False) + self.vicreg_eps)
+        std_loss = torch.mean(F.relu(1.0 - std_z1)) + torch.mean(F.relu(1.0 - std_z2))
+
+        cov_z1 = (z1.T @ z1) / max(z1.shape[0] - 1, 1)
+        cov_z2 = (z2.T @ z2) / max(z2.shape[0] - 1, 1)
+        cov_loss = self._off_diagonal(cov_z1).pow(2).sum() / z1.shape[1]
+        cov_loss = cov_loss + self._off_diagonal(cov_z2).pow(2).sum() / z2.shape[1]
+
+        return (
+            self.vicreg_sim_coef * repr_loss
+            + self.vicreg_std_coef * std_loss
+            + self.vicreg_cov_coef * cov_loss
+        )
+
+    def _encoder_auxiliary_loss(self, critic_obs_batch, obs_history_batch, view1_batch, view2_batch):
+        if not self.encoder.is_mlp_encoder:
+            return torch.zeros((), device=self.device)
+
+        # Use forward(), not encode(), because encode() may detach for actor use.
+        z = self.encoder(obs_history_batch)
+        explicit_dim = min(self.encoder_explicit_dim, z.shape[1], critic_obs_batch.shape[1])
+
+        if explicit_dim > 0 and self.mse_loss_coef != 0.0:
+            mse_loss = (z[:, :explicit_dim] - critic_obs_batch[:, :explicit_dim]).pow(2).mean()
+        else:
+            mse_loss = torch.zeros((), dtype=z.dtype, device=z.device)
+
+        implicit_start = explicit_dim
+        if self.vicreg_loss_coef != 0.0 and implicit_start < z.shape[1]:
+            z1 = self.encoder(view1_batch)[:, implicit_start:]
+            z2 = self.encoder(view2_batch)[:, implicit_start:]
+            vicreg_loss = self._vicreg_loss(z1, z2)
+        else:
+            vicreg_loss = torch.zeros((), dtype=z.dtype, device=z.device)
+
+        return self.mse_loss_coef * mse_loss + self.vicreg_loss_coef * vicreg_loss
 
     def update(self):
         num_updates = 0
@@ -253,7 +327,6 @@ class PPO:
             ratio = torch.exp(
                 actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
             )
-            # print(ratio)
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
@@ -305,30 +378,29 @@ class PPO:
                 next_obs_batch,
                 critic_obs_batch,
                 obs_history_batch,
+                vicreg_view1_batch,
+                vicreg_view2_batch,
             ) in generator:
-                if self.encoder.is_mlp_encoder:
-                    self.encoder.encode(obs_history_batch)
-                    encode_batch = self.encoder.get_encoder_out()
-
-                if self.encoder.is_mlp_encoder:
-                    extra_loss = (
-                        (encode_batch[:, 0:3] - critic_obs_batch[:, 0:3]).pow(2).mean()
-                    )
-                else:
-                    extra_loss = torch.zeros_like(value_loss)
+                extra_loss = self._encoder_auxiliary_loss(
+                    critic_obs_batch,
+                    obs_history_batch,
+                    vicreg_view1_batch,
+                    vicreg_view2_batch,
+                )
 
                 self.extra_optimizer.zero_grad()
                 extra_loss.backward()
+                nn.utils.clip_grad_norm_(self.encoder.parameters(), self.max_grad_norm)
                 self.extra_optimizer.step()
 
                 num_updates_extra += 1
                 mean_extra_loss += extra_loss.item()
 
-        mean_value_loss /= num_updates
+        mean_value_loss /= max(num_updates, 1)
         if num_updates_extra > 0:
-            mean_extra_loss /= num_updates
-        mean_surrogate_loss /= num_updates
-        mean_kl /= num_updates
+            mean_extra_loss /= num_updates_extra
+        mean_surrogate_loss /= max(num_updates, 1)
+        mean_kl /= max(num_updates, 1)
         self.storage.clear()
 
         return (mean_value_loss, mean_extra_loss, mean_surrogate_loss, mean_kl)
