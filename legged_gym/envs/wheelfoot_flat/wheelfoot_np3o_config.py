@@ -365,7 +365,9 @@ class BipedCfgNP3OWF(BaseConfig):
     class MLP_Encoder:
         output_detach = True
         num_input_dim = BipedCfgWF.env.num_observations * BipedCfgWF.env.obs_history_length
-        num_output_dim = 3
+        explicit_dim = 3
+        implicit_dim = 16
+        num_output_dim = explicit_dim + implicit_dim
         hidden_dims = [256, 128]
         activation = "elu"
         orthogonal_init = False
@@ -396,6 +398,15 @@ class BipedCfgNP3OWF(BaseConfig):
         est_learning_rate = 1.0e-3
         ts_learning_rate = 1.0e-4
         critic_take_latent = True
+
+        # Extra encoder training params
+        encoder_explicit_dim = BipedCfgNP3OWF.MLP_Encoder.explicit_dim
+        mse_loss_coef = 1.0
+        vicreg_loss_coef = 0.05
+        vicreg_sim_coef = 25.0
+        vicreg_std_coef = 25.0
+        vicreg_cov_coef = 1.0
+        vicreg_eps = 1.0e-4
 
         # NP3O training params
         cost_limit = BipedCfgWF.costs.limit
