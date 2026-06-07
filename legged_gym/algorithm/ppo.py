@@ -95,10 +95,9 @@ class PPO:
         self.vicreg_cov_coef = float(vicreg_cov_coef)
         self.vicreg_eps = float(vicreg_eps)
 
-        # PPO components
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
-        self.storage = None  # initialized later
+        self.storage = None
         self.optimizer = optim.Adam([{"params": self.actor_critic.parameters()}], lr=learning_rate)
 
         if self.encoder.num_output_dim != 0:
@@ -109,7 +108,6 @@ class PPO:
             self.extra_optimizer = None
         self.transition = RolloutStorage.Transition()
 
-        # PPO parameters
         self.clip_param = clip_param
         self.num_learning_epochs = num_learning_epochs
         self.num_mini_batches = num_mini_batches
@@ -149,25 +147,20 @@ class PPO:
 
     def act(self, obs, obs_history, commands, critic_obs, vicreg_view1=None, vicreg_view2=None):
         critic_obs = torch.cat((critic_obs, commands), dim=-1)
-        # act. The encoder output is detached here by design; the encoder is
-        # optimized only by the explicit privileged MSE and VICReg objectives.
         encoder_out = self.encoder.encode(obs_history)
         self.transition.actions = self.actor_critic.act(
             torch.cat((encoder_out, obs, commands), dim=-1)
         ).detach()
 
-        # evaluate
         if self.critic_take_latent:
             critic_obs = torch.cat((critic_obs, encoder_out), dim=-1)
         self.transition.values = self.actor_critic.evaluate(critic_obs).detach()
 
-        # storage
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(
             self.transition.actions
         ).detach()
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
-        # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.critic_obs = critic_obs
         self.transition.observation_history = obs_history
@@ -176,10 +169,9 @@ class PPO:
         self.transition.commands = commands
         return self.transition.actions
 
-    def process_env_step(self, rewards, dones, infos, next_obs=None):
+    def process_env_step(self, rewards, dones, infos, next_obs=None, env=None):
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
-        # Bootstrapping on time outs
         if "time_outs" in infos:
             self.transition.rewards += self.gamma * torch.squeeze(
                 self.transition.values
@@ -187,7 +179,6 @@ class PPO:
                 1,
             )
 
-        # Record the transition
         self.transition.next_observations = next_obs
         self.storage.add_transitions(self.transition)
         self.transition.clear()
@@ -233,7 +224,6 @@ class PPO:
         if not self.encoder.is_mlp_encoder:
             return torch.zeros((), device=self.device)
 
-        # Use forward(), not encode(), because encode() may detach for actor use.
         z = self.encoder(obs_history_batch)
         explicit_dim = min(self.encoder_explicit_dim, z.shape[1], critic_obs_batch.shape[1])
 
@@ -307,7 +297,6 @@ class PPO:
                 )
                 kl_mean = torch.mean(kl)
 
-            # KL
             if self.desired_kl != None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     if kl_mean > self.desired_kl * 2.0:
@@ -323,7 +312,6 @@ class PPO:
                     print("early stop, num_updates =", num_updates)
                     break
 
-            # Surrogate loss
             ratio = torch.exp(
                 actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
             )
@@ -333,7 +321,6 @@ class PPO:
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # Value function loss
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (
                     value_batch - target_values_batch
@@ -357,7 +344,6 @@ class PPO:
                 )
                 self.optimizer.param_groups[0]["lr"] = frac * self.learning_rate
 
-            # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
