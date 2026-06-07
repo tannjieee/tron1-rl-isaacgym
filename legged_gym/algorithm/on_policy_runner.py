@@ -88,6 +88,12 @@ class OnPolicyRunner:
 
         _ = self.env.reset()
 
+    def _get_vicreg_views(self):
+        if not hasattr(self.env, "get_vicreg_observations"):
+            return None, None
+        _, view1, view2 = self.env.get_vicreg_observations()
+        return view1.to(self.device), view2.to(self.device)
+
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         if self.log_dir is not None and self.writer is None:
             self.logger_type = self.cfg.get("logger", "tensorboard")
@@ -135,7 +141,17 @@ class OnPolicyRunner:
             start = time.time()
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
-                    actions = self.alg.act(obs, obs_history, commands, critic_obs)
+                    # These views must be captured before env.step(), because they
+                    # correspond to the same history used by the current action.
+                    vicreg_view1, vicreg_view2 = self._get_vicreg_views()
+                    actions = self.alg.act(
+                        obs,
+                        obs_history,
+                        commands,
+                        critic_obs,
+                        vicreg_view1=vicreg_view1,
+                        vicreg_view2=vicreg_view2,
+                    )
                     (
                         obs,
                         rewards,
@@ -338,25 +354,32 @@ class OnPolicyRunner:
         print(log_string)
 
     def save(self, path, infos=None):
-        torch.save(
-            {
-                "model_state_dict": self.alg.actor_critic.state_dict(),
-                "encoder_state_dict": self.alg.encoder.state_dict(),
-                "optimizer_state_dict": self.alg.optimizer.state_dict(),
-                "iter": self.current_learning_iteration,
-                "infos": infos,
-            },
-            path,
-        )
+        checkpoint = {
+            "model_state_dict": self.alg.actor_critic.state_dict(),
+            "encoder_state_dict": self.alg.encoder.state_dict(),
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "iter": self.current_learning_iteration,
+            "infos": infos,
+        }
+        if self.alg.extra_optimizer is not None:
+            checkpoint["extra_optimizer_state_dict"] = self.alg.extra_optimizer.state_dict()
+        torch.save(checkpoint, path)
 
     def load(self, path, load_optimizer=False):
         loaded_dict = torch.load(path)
         self.alg.actor_critic.load_state_dict(
             loaded_dict["model_state_dict"], strict=False
         )
-        self.alg.encoder.load_state_dict(loaded_dict["encoder_state_dict"])
+        self.alg.encoder.load_state_dict(loaded_dict["encoder_state_dict"], strict=False)
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            if (
+                self.alg.extra_optimizer is not None
+                and "extra_optimizer_state_dict" in loaded_dict
+            ):
+                self.alg.extra_optimizer.load_state_dict(
+                    loaded_dict["extra_optimizer_state_dict"]
+                )
         self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
