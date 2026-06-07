@@ -72,9 +72,28 @@ class BipedWF(BaseTask):
         self.episode_length_buf[env_ids] = 0
         self.envs_steps_buf[env_ids] = 0
         self.reset_buf[env_ids] = 1
+        
+        # self.obs_history[env_ids] = 0
+        # obs_buf, _ = self.compute_group_observations()
+        # self.obs_history[env_ids] = obs_buf[env_ids].repeat(1, self.obs_history_length)
         self.obs_history[env_ids] = 0
+        self.obs_history_clean[env_ids] = 0
+        self.vicreg_obs_history_view1[env_ids] = 0
+        self.vicreg_obs_history_view2[env_ids] = 0
         obs_buf, _ = self.compute_group_observations()
-        self.obs_history[env_ids] = obs_buf[env_ids].repeat(1, self.obs_history_length)
+        obs_buf = self._apply_randomized_imu_offset_to_obs(obs_buf.clone())
+        obs_buf_noisy = self._add_independent_obs_noise(obs_buf)
+        self.obs_history_clean[env_ids] = obs_buf[env_ids].repeat(
+            1, self.obs_history_length
+        )
+        self.obs_history[env_ids] = obs_buf_noisy[env_ids].repeat(
+            1, self.obs_history_length
+        )
+        (
+            self.vicreg_obs_history_view1,
+            self.vicreg_obs_history_view2,
+        ) = self._make_vicreg_history_views(self.obs_history_clean)
+        
         self.gait_indices[env_ids] = 0
         self.fail_buf[env_ids] = 0
         self.action_fifo[env_ids] = 0
@@ -504,6 +523,32 @@ class BipedWF(BaseTask):
         )
         return obs_buf, critic_obs_buf
 
+    def compute_observations(self):
+        """
+        Computes actor/critic observations and prepares clean/noisy history
+        tensors for future VICReg-style encoder training.
+
+        No VICReg loss is added here.
+        No feature dropout is used.
+        """
+        actor_obs_raw, self.critic_obs_buf = self.compute_group_observations()
+
+        actor_obs_clean = self._apply_randomized_imu_offset_to_obs(
+            actor_obs_raw.clone()
+        )
+        self.obs_buf_clean = actor_obs_clean
+        self._replace_actor_slice_in_critic_obs(actor_obs_clean)
+
+        actor_obs_noisy = self._add_independent_obs_noise(actor_obs_clean)
+        self.obs_buf = actor_obs_noisy
+
+        self._roll_history_buffers(actor_obs_clean, actor_obs_noisy)
+
+        (
+            self.vicreg_obs_history_view1,
+            self.vicreg_obs_history_view2,
+        ) = self._make_vicreg_history_views(self.obs_history_clean)
+
     def _process_rigid_body_props(self, props, env_id):
         # randomize base mass
         if self.cfg.domain_rand.randomize_base_mass:
@@ -671,6 +716,75 @@ class BipedWF(BaseTask):
         noise_vec[20:] = 0.0  # previous actions
         return noise_vec
 
+    def _apply_randomized_imu_offset_to_obs(self, obs_buf):
+        if self.cfg.domain_rand.randomize_imu_offset:
+            randomized_base_quat = quat_mul(self.random_imu_offset, self.base_quat)
+            obs_buf[:, :3] = (
+                quat_rotate_inverse(randomized_base_quat, self.root_states[:, 10:13])
+                * self.obs_scales.ang_vel
+            )
+            obs_buf[:, 3:6] = quat_rotate_inverse(
+                randomized_base_quat, self.gravity_vec
+            )
+        return obs_buf
+
+    def _add_independent_obs_noise(self, obs_buf):
+        if not self.add_noise:
+            return obs_buf.clone()
+        noise = (2.0 * torch.rand_like(obs_buf) - 1.0) * self.noise_scale_vec
+        return obs_buf + noise
+
+    def _make_vicreg_history_views(self, clean_history):
+        if not self.add_noise:
+            return clean_history.clone(), clean_history.clone()
+
+        hist = clean_history.view(
+            self.num_envs,
+            self.obs_history_length,
+            self.num_obs,
+        )
+        noise_scale = self.noise_scale_vec.view(1, 1, self.num_obs)
+
+        view1 = hist + (2.0 * torch.rand_like(hist) - 1.0) * noise_scale
+        view2 = hist + (2.0 * torch.rand_like(hist) - 1.0) * noise_scale
+
+        return (
+            view1.reshape(self.num_envs, self.obs_history_length * self.num_obs),
+            view2.reshape(self.num_envs, self.obs_history_length * self.num_obs),
+        )
+
+    def _replace_actor_slice_in_critic_obs(self, actor_obs_clean):
+        start = 3  # base_lin_vel occupies critic_obs[:, 0:3]
+        end = start + self.num_obs
+        if self.critic_obs_buf.shape[1] >= end:
+            self.critic_obs_buf[:, start:end] = actor_obs_clean
+
+    def _roll_history_buffers(self, actor_obs_clean, actor_obs_noisy):
+        self.obs_history_clean = torch.cat(
+            (self.obs_history_clean[:, self.num_obs:], actor_obs_clean),
+            dim=-1,
+        )
+        self.obs_history = torch.cat(
+            (self.obs_history[:, self.num_obs:], actor_obs_noisy),
+            dim=-1,
+        )
+
+        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+        if reset_env_ids.numel() > 0:
+            self.obs_history_clean[reset_env_ids] = actor_obs_clean[
+                reset_env_ids
+            ].repeat(1, self.obs_history_length)
+            self.obs_history[reset_env_ids] = actor_obs_noisy[
+                reset_env_ids
+            ].repeat(1, self.obs_history_length)
+
+    def get_vicreg_observations(self):
+        return (
+            self.obs_history_clean,
+            self.vicreg_obs_history_view1,
+            self.vicreg_obs_history_view2,
+        )
+
     def _init_buffers(self):
         super()._init_buffers()
         self.nominal_p_gains = self._build_nominal_gains(self.cfg.control.stiffness)
@@ -681,7 +795,8 @@ class BipedWF(BaseTask):
         self.right_leg_dof_ids = self._dof_indices(side="right", include_wheel=False)
         self.left_wheel_dof_ids = self._dof_indices(side="left", include_wheel=True)
         self.right_wheel_dof_ids = self._dof_indices(side="right", include_wheel=True)
-        self.ku_target_dim = 11
+
+        self.ku_target_dim = int(self._get_ku_cfg_value("target_dim", 11))
         self.kinematic_utility_target = torch.zeros(
             self.num_envs,
             self.ku_target_dim,
@@ -697,6 +812,12 @@ class BipedWF(BaseTask):
             requires_grad=False,
         )
         self.ku_nominal_foot_pos_base = self._feet_pos_base_frame().detach().clone()
+        # buffers for encoder observation history and VICReg
+        self.obs_buf_clean = torch.zeros_like(self.obs_buf)
+        self.obs_history_clean = torch.zeros_like(self.obs_history)
+        self.vicreg_obs_history_view1 = torch.zeros_like(self.obs_history)
+        self.vicreg_obs_history_view2 = torch.zeros_like(self.obs_history)
+
 
     # ------------ reward functions----------------
 
