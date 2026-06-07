@@ -138,8 +138,15 @@ class NP3O(PPO):
 
         return torch.zeros(n, self.num_costs, device=self.device)
 
-    def act(self, obs, obs_history, commands, critic_obs):
-        actions = super().act(obs, obs_history, commands, critic_obs)
+    def act(self, obs, obs_history, commands, critic_obs, vicreg_view1=None, vicreg_view2=None):
+        actions = super().act(
+            obs,
+            obs_history,
+            commands,
+            critic_obs,
+            vicreg_view1=vicreg_view1,
+            vicreg_view2=vicreg_view2,
+        )
         self.transition.cost_values = self.actor_critic.evaluate_cost(self.transition.critic_obs).detach()
         return actions
 
@@ -274,15 +281,11 @@ class NP3O(PPO):
         if self.extra_optimizer is None:
             return 0.0
         generator = self.storage.encoder_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-        for _, critic_obs_b, hist_b in generator:
-            if self.encoder.is_mlp_encoder:
-                self.encoder.encode(hist_b)
-                enc_b = self.encoder.get_encoder_out()
-                loss = (enc_b[:, 0:3] - critic_obs_b[:, 0:3]).pow(2).mean()
-            else:
-                loss = torch.zeros(1, device=self.device).mean()
+        for _, critic_obs_b, hist_b, view1_b, view2_b in generator:
+            loss = self._encoder_auxiliary_loss(critic_obs_b, hist_b, view1_b, view2_b)
             self.extra_optimizer.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(self.encoder.parameters(), self.max_grad_norm)
             self.extra_optimizer.step()
             n += 1
             mean_loss += loss.item()
