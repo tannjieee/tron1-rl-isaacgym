@@ -48,6 +48,8 @@ class MLP_Encoder(nn.Module):
         activation="elu",
         orthogonal_init=False,
         output_detach=False,
+        explicit_dim=None,
+        implicit_dim=None,
         **kwargs,
     ):
         if kwargs:

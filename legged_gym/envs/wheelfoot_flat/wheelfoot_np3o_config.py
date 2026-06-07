@@ -400,7 +400,7 @@ class BipedCfgNP3OWF(BaseConfig):
         critic_take_latent = True
 
         # Extra encoder training params
-        encoder_explicit_dim = BipedCfgNP3OWF.MLP_Encoder.explicit_dim
+        encoder_explicit_dim = 3
         mse_loss_coef = 1.0
         vicreg_loss_coef = 0.05
         vicreg_sim_coef = 25.0
